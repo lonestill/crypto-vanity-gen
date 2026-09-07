@@ -1,0 +1,9 @@
+/target
+/output
+*.log
+.DS_Store
+*.key
+*.pem
+*.priv
+wallets*.json
+wallets*.txt
