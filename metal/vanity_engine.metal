@@ -673,7 +673,7 @@ kernel void eoa_search(
 ) {
     if (id >= total_threads) return;
 
-    uint32_t idx = id * 4;
+    uint32_t idx = id * 8;
     uint32_t a = idx & 0xff;
     uint32_t b = (idx >> 8) & 0xff;
     uint32_t c = (idx >> 16) & 0xff;
@@ -688,29 +688,29 @@ kernel void eoa_search(
     p0 = point_add_mixed(p0, table2[b]);
     p0 = point_add_mixed(p0, table3[c]);
 
-    PointJac pts[4];
+    PointJac pts[8];
     pts[0] = p0;
-    pts[1] = point_add_mixed(pts[0], G_AFFINE);
-    pts[2] = point_add_mixed(pts[1], G_AFFINE);
-    pts[3] = point_add_mixed(pts[2], G_AFFINE);
+    for (int j = 1; j < 8; ++j) {
+        pts[j] = point_add_mixed(pts[j - 1], G_AFFINE);
+    }
 
-    fe256 prod_z[4];
+    fe256 prod_z[8];
     prod_z[0] = pts[0].z;
-    prod_z[1] = fe_mul(prod_z[0], pts[1].z);
-    prod_z[2] = fe_mul(prod_z[1], pts[2].z);
-    prod_z[3] = fe_mul(prod_z[2], pts[3].z);
+    for (int j = 1; j < 8; ++j) {
+        prod_z[j] = fe_mul(prod_z[j - 1], pts[j].z);
+    }
 
-    fe256 inv_all = fe_inv(prod_z[3]);
+    fe256 inv_all = fe_inv(prod_z[7]);
 
-    fe256 z_inv[4];
+    fe256 z_inv[8];
     fe256 cur_inv = inv_all;
-    for (int i = 3; i > 0; --i) {
+    for (int i = 7; i > 0; --i) {
         z_inv[i] = fe_mul(cur_inv, prod_z[i - 1]);
         cur_inv = fe_mul(cur_inv, pts[i].z);
     }
     z_inv[0] = cur_inv;
 
-    for (int j = 0; j < 4; ++j) {
+    for (int j = 0; j < 8; ++j) {
         fe256 zi2 = fe_sqr(z_inv[j]);
         fe256 zi3 = fe_mul(zi2, z_inv[j]);
         fe256 qx = fe_mul(pts[j].x, zi2);

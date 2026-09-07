@@ -324,7 +324,7 @@ mod tests {
         let base_point = point_from_pubkey(&base_pk);
 
         let matches = engine.run_eoa_batch(&base_point, 1, 0, &[]);
-        assert_eq!(matches.len(), 4);
+        assert_eq!(matches.len(), 8);
 
         for m in matches {
             let offset = m.salt_low;

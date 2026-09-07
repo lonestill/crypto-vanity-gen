@@ -686,8 +686,8 @@ vanity-gen v0.2.0 [darwin/aarch64]");
     let secp = Secp256k1::new();
     let mut rng = rand::thread_rng();
 
-    let total_threads = 131072u32;
-    let keys_per_thread = 4u64;
+    let total_threads = 262144u32;
+    let keys_per_thread = 8u64;
     let batch_size = (total_threads as u64) * keys_per_thread;
 
     let mut current_target_stage = initial_stage;
