@@ -581,6 +581,10 @@ fn ui(f: &mut ratatui::Frame, app: &mut App, filtered_indices: &[usize]) {
 
             let priv_color = if app.show_private_key { Color::LightGreen } else { Color::DarkGray };
 
+            let is_create2 = w.pattern.contains("factory:") || w.pattern.contains("salt:");
+            let key_label = if is_create2 { "Deploy Salt:  " } else { "Private Key:  " };
+            let type_note = if is_create2 { "  [CREATE2 Contract Salt - not an EOA key]" } else { "" };
+
             let details = Paragraph::new(vec![
                 Line::from(vec![
                     Span::styled("Address:      ", Style::default().fg(Color::DarkGray)),
@@ -588,8 +592,9 @@ fn ui(f: &mut ratatui::Frame, app: &mut App, filtered_indices: &[usize]) {
                     Span::styled(format!("  [{}]", w.network), Style::default().fg(Color::Cyan)),
                 ]),
                 Line::from(vec![
-                    Span::styled("Private Key:  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(key_label, Style::default().fg(if is_create2 { Color::Yellow } else { Color::DarkGray })),
                     Span::styled(priv_display, Style::default().fg(priv_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(type_note, Style::default().fg(Color::Yellow)),
                 ]),
                 Line::from(vec![
                     Span::styled("Metadata:     ", Style::default().fg(Color::DarkGray)),
