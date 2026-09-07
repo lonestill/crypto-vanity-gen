@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, AtomicUsize, Ordering}
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::thread;
+use std::io::Write;
+use rand::RngCore;
+use secp256k1::{Secp256k1, SecretKey, PublicKey, Scalar};
 use colored::*;
 use clap::Parser;
 use chrono::Local;
@@ -136,11 +139,24 @@ fn main() {
         return;
     }
 
-    let is_create2_mode = args.create2 || args.gpu || args.network.to_ascii_lowercase() == "create2";
+    let is_create2_mode = args.create2 || args.network.to_ascii_lowercase() == "create2";
 
     if is_create2_mode {
         run_create2_engine(&args);
         return;
+    }
+
+    let is_eoa_gpu_mode = args.gpu;
+    if is_eoa_gpu_mode {
+        #[cfg(target_os = "macos")]
+        {
+            run_eoa_engine(&args);
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("Metal GPU is only supported on macOS Apple Silicon. Falling back to CPU workers.");
+        }
     }
 
     run_wallet_engine(&args);
@@ -506,6 +522,346 @@ fn run_create2_engine(args: &Args) {
     println!("\n--------------------------------------------------------------------------------");
     println!("session complete.");
     println!("total salts evaluated: {}", format_number(total_salts.load(Ordering::Relaxed)));
+    println!("matches found:         {}", total_found.load(Ordering::Relaxed));
+    println!("tier-0 [ex]:           {}", count_godlike.load(Ordering::Relaxed));
+    println!("tier-1 [s]:            {}", count_mythic.load(Ordering::Relaxed));
+    println!("tier-2 [a]:            {}", count_legendary.load(Ordering::Relaxed));
+    println!("tier-3 [b]:            {}", count_epic.load(Ordering::Relaxed));
+    println!("vault directory:       {}", args.output_dir);
+    println!("--------------------------------------------------------------------------------");
+}
+
+#[cfg(target_os = "macos")]
+fn run_eoa_engine(args: &Args) {
+    let min_rarity = parse_min_rarity(&args.min_rarity);
+
+    let raw_target = if let Some(ref t) = args.target {
+        let t_trimmed = t.trim();
+        if t_trimmed.starts_with("0x") || t_trimmed.starts_with("0X") {
+            t_trimmed[2..].to_string()
+        } else {
+            t_trimmed.to_string()
+        }
+    } else {
+        String::new()
+    };
+
+    let mut clean_target = String::new();
+    let mut stripped_non_hex = false;
+    for c in raw_target.chars() {
+        if c.is_ascii_hexdigit() {
+            clean_target.push(c.to_ascii_lowercase());
+        } else {
+            stripped_non_hex = true;
+        }
+    }
+
+    if stripped_non_hex && !raw_target.is_empty() {
+        eprintln!("[NOTE] Stripped non-hex chars for EVM target: '{}' -> '0x{}'", raw_target, clean_target);
+    }
+
+    let mut target_nibbles = Vec::new();
+    if !clean_target.is_empty() {
+        for c in clean_target.chars() {
+            if let Some(d) = c.to_digit(16) {
+                target_nibbles.push(d as u8);
+            }
+        }
+    }
+
+    let min_zeros = if !clean_target.is_empty() {
+        3u32.min(target_nibbles.len() as u32)
+    } else {
+        match min_rarity {
+            Rarity::Godlike => 8u32,
+            Rarity::Mythic => 7u32,
+            Rarity::Legendary => 6u32,
+            Rarity::Epic => 6u32,
+            Rarity::Rare => 6u32,
+        }
+    };
+
+    let metal_engine = if metal::MetalEngine::is_supported() {
+        metal::MetalEngine::init()
+    } else {
+        None
+    };
+
+    let storage = Arc::new(Storage::new(&args.output_dir));
+    let running = Arc::new(AtomicBool::new(true));
+    let r_clone = running.clone();
+
+    let _ = ctrlc::set_handler(move || {
+        eprintln!("
+interrupt signal received. finalizing writes...");
+        r_clone.store(false, Ordering::SeqCst);
+    });
+
+    let total_salts = Arc::new(AtomicU64::new(0));
+    let total_found = Arc::new(AtomicU32::new(0));
+    let count_godlike = Arc::new(AtomicU32::new(0));
+    let count_mythic = Arc::new(AtomicU32::new(0));
+    let count_legendary = Arc::new(AtomicU32::new(0));
+    let count_epic = Arc::new(AtomicU32::new(0));
+
+    let has_target = !clean_target.is_empty();
+    let target_len = clean_target.len();
+    let initial_stage = if has_target {
+        3u32.min(target_len as u32)
+    } else {
+        0
+    };
+    let target_stage_atomic = Arc::new(AtomicU32::new(initial_stage));
+
+    println!("
+vanity-gen v0.2.0 [darwin/aarch64]");
+    if let Some(ref eng) = metal_engine {
+        println!("engine:    Metal GPU Compute [{}]", eng.name());
+    } else {
+        println!("engine:    CPU Fallback (Metal unavailable)");
+    }
+    println!("mode:      EVM Personal Wallet Vanity Generator (secp256k1)");
+    if has_target {
+        println!("target:    0x{}", clean_target);
+        println!("milestone: progressive stages starting from 3 chars");
+    } else {
+        let filter_name = match min_rarity {
+            Rarity::Godlike => ">= 8 leading zeros [TIER-0 [EX]]",
+            Rarity::Mythic => ">= 7 leading zeros [TIER-1 [S]]",
+            _ => ">= 6 leading zeros [TIER-2 [A]]",
+        };
+        println!("filter:    {}", filter_name);
+    }
+    println!("limit:     {}", if args.count > 0 { format!("{} matches", args.count) } else { "continuous (Ctrl+C to stop)".to_string() });
+    println!("vault:     {}", args.output_dir);
+    println!("--------------------------------------------------------------------------------");
+
+    let s_running = running.clone();
+    let s_salts = total_salts.clone();
+    let s_found = total_found.clone();
+    let s_has_target = has_target;
+    let s_clean_target = clean_target.clone();
+    let s_target_stage = target_stage_atomic.clone();
+    let start_time = Instant::now();
+
+    let stats_thread = thread::spawn(move || {
+        let mut last_salts = 0u64;
+        let mut last_time = Instant::now();
+        while s_running.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(500));
+            let now = Instant::now();
+            let elapsed_total = now.duration_since(start_time).as_secs();
+            let elapsed_interval = now.duration_since(last_time).as_secs_f64();
+            let cur_salts = s_salts.load(Ordering::Relaxed);
+            let diff = cur_salts.saturating_sub(last_salts);
+            last_salts = cur_salts;
+            last_time = now;
+            let mhs = if elapsed_interval > 0.0 {
+                (diff as f64 / elapsed_interval) / 1_000_000.0
+            } else {
+                0.0
+            };
+            let mins = elapsed_total / 60;
+            let secs = elapsed_total % 60;
+            let found = s_found.load(Ordering::Relaxed);
+            let display_target = if s_has_target {
+                format!("0x{} (stage >= {})", s_clean_target, s_target_stage.load(Ordering::Relaxed))
+            } else {
+                ">= 6 zeros [LEGENDARY+]".to_string()
+            };
+            eprint!(
+                "\r[{:02}:{:02}] {:6.2} MH/s | keys: {:12} | target: {} | found: {}",
+                mins,
+                secs,
+                mhs,
+                format_number(cur_salts),
+                display_target,
+                found
+            );
+            let _ = std::io::stdout().flush();
+        }
+        eprint!("\r{}\r", " ".repeat(100));
+    });
+
+    let secp = Secp256k1::new();
+    let mut rng = rand::thread_rng();
+
+    let total_threads = 131072u32;
+    let keys_per_thread = 4u64;
+    let batch_size = (total_threads as u64) * keys_per_thread;
+
+    let mut current_target_stage = initial_stage;
+
+    if let Some(ref engine) = metal_engine {
+        while running.load(Ordering::Relaxed) {
+            let active_min_zeros = if has_target {
+                current_target_stage
+            } else {
+                min_zeros
+            };
+
+            let mut base_priv = [0u8; 32];
+            rng.fill_bytes(&mut base_priv);
+            base_priv[0] &= 0x7f;
+            if base_priv[0] == 0 {
+                base_priv[0] = 1;
+            }
+
+            let base_sk = match SecretKey::from_slice(&base_priv) {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+            let base_pk = PublicKey::from_secret_key(&secp, &base_sk);
+            let base_point = metal::point_from_pubkey(&base_pk);
+
+            let matches = engine.run_eoa_batch(&base_point, total_threads, active_min_zeros, &target_nibbles);
+
+            total_salts.fetch_add(batch_size, Ordering::Relaxed);
+
+            for m in matches {
+                let offset = m.salt_low;
+                let mut tweak = [0u8; 32];
+                tweak[24..32].copy_from_slice(&offset.to_be_bytes());
+                let scalar = match Scalar::from_be_bytes(tweak) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let match_sk = match base_sk.add_tweak(&scalar) {
+                    Ok(k) => k,
+                    Err(_) => continue,
+                };
+                let priv_hex = chains::evm::hex::encode(&match_sk.secret_bytes());
+                let priv_hex_0x = format!("0x{}", priv_hex);
+                let short_priv = format!("0x{}...", &priv_hex[..8]);
+
+                let addr_str = EvmGenerator::format_address_checksum(&m.address);
+                let clean_addr = addr_str.trim_start_matches("0x");
+
+                let eval_match = if has_target {
+                    let match_len = calc_prefix_match(clean_addr, &clean_target, false);
+                    if match_len >= current_target_stage as usize {
+                        if match_len < target_len {
+                            current_target_stage = (match_len as u32 + 1).min(target_len as u32);
+                            target_stage_atomic.store(current_target_stage, Ordering::Relaxed);
+                        }
+                        let rarity = if match_len >= target_len {
+                            Rarity::Godlike
+                        } else if match_len >= 6 {
+                            Rarity::Mythic
+                        } else {
+                            Rarity::Legendary
+                        };
+                        let matched_slice = &clean_addr[..match_len];
+                        Some(analyzer::BeautyMatch {
+                            rarity,
+                            theme: Theme::CustomTarget,
+                            score: (match_len as u32 * 110).min(1000),
+                            title: format!("EVM Target milestone [{}/{}]: 0x{}", match_len, target_len, matched_slice),
+                            pattern: format!("Target: 0x{} (matched: 0x{})", clean_target, matched_slice),
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    Analyzer::evaluate(Network::Evm, &addr_str)
+                };
+
+                let beauty = match eval_match {
+                    Some(b) => b,
+                    None => continue,
+                };
+
+                if beauty.rarity < min_rarity || beauty.rarity < Rarity::Legendary {
+                    continue;
+                }
+
+                total_found.fetch_add(1, Ordering::Relaxed);
+                match beauty.rarity {
+                    Rarity::Godlike => { count_godlike.fetch_add(1, Ordering::Relaxed); }
+                    Rarity::Mythic => { count_mythic.fetch_add(1, Ordering::Relaxed); }
+                    Rarity::Legendary => { count_legendary.fetch_add(1, Ordering::Relaxed); }
+                    Rarity::Epic => { count_epic.fetch_add(1, Ordering::Relaxed); }
+                    Rarity::Rare => {}
+                }
+
+                let wallet = GeneratedWallet {
+                    network: Network::Evm,
+                    address: addr_str.clone(),
+                    private_key: priv_hex_0x.clone(),
+                    rarity: beauty.rarity,
+                    theme: beauty.theme,
+                    score: beauty.score,
+                    title: beauty.title.clone(),
+                    pattern: beauty.pattern.clone(),
+                    timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                };
+
+                storage.save(&wallet);
+
+                let time_str = Local::now().format("%H:%M:%S").to_string();
+
+                if has_target {
+                    let match_len = calc_prefix_match(clean_addr, &clean_target, false);
+                    let matched_slice = &clean_addr[..match_len];
+                    if match_len >= target_len {
+                        println!(
+                            "\r[{}] [{}] [EVM/GPU] {}  {} | matched: 0x{} --> COMPLETE",
+                            time_str.bright_black(),
+                            "TARGET: FULL".bright_green().bold(),
+                            addr_str.bright_green().bold(),
+                            format!("(priv: {})", short_priv).bright_black(),
+                            matched_slice.bright_yellow().bold()
+                        );
+                        if args.count > 0 && total_found.load(Ordering::Relaxed) >= args.count {
+                            running.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                    } else {
+                        println!(
+                            "\r[{}] [STAGE: {}/{}] [EVM/GPU] {}  {} | matched: 0x{}",
+                            time_str.bright_black(),
+                            match_len,
+                            target_len,
+                            addr_str.bright_white().bold(),
+                            format!("(priv: {})", short_priv).bright_black(),
+                            matched_slice.bright_yellow().bold()
+                        );
+                    }
+                } else {
+                    let rarity_badge = match beauty.rarity {
+                        Rarity::Godlike => "TIER-0 [EX]".black().on_bright_magenta().bold(),
+                        Rarity::Mythic => "TIER-1 [S] ".black().on_bright_yellow().bold(),
+                        Rarity::Legendary => "TIER-2 [A] ".black().on_bright_cyan().bold(),
+                        _ => "TIER-3 [B] ".black().on_bright_blue().bold(),
+                    };
+                    println!(
+                        "\r[{}] [{}] [EVM/GPU] {}  {} | {}",
+                        time_str.bright_black(),
+                        rarity_badge,
+                        addr_str.bright_white().bold(),
+                        format!("(priv: {})", short_priv).bright_black(),
+                        beauty.title.bright_yellow()
+                    );
+                }
+
+                if args.count > 0 && total_found.load(Ordering::Relaxed) >= args.count {
+                    running.store(false, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    } else {
+        eprintln!("Metal engine not available. Falling back to CPU.");
+        run_wallet_engine(args);
+        return;
+    }
+
+    let _ = stats_thread.join();
+
+    println!("
+--------------------------------------------------------------------------------");
+    println!("session complete.");
+    println!("total keys evaluated:  {}", format_number(total_salts.load(Ordering::Relaxed)));
     println!("matches found:         {}", total_found.load(Ordering::Relaxed));
     println!("tier-0 [ex]:           {}", count_godlike.load(Ordering::Relaxed));
     println!("tier-1 [s]:            {}", count_mythic.load(Ordering::Relaxed));
