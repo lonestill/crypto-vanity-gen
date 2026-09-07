@@ -237,6 +237,8 @@ struct App {
     status_message: Option<(String, Instant)>,
     output_dir: String,
     confirm_clear: bool,
+    search_mode: bool,
+    search_query: String,
 }
 
 const THEME_TABS: &[(&str, Option<Theme>)] = &[
@@ -265,6 +267,8 @@ fn run_app(
         status_message: None,
         output_dir: output_dir.to_string(),
         confirm_clear: false,
+        search_mode: false,
+        search_query: String::new(),
     };
 
     if !app.wallets.is_empty() {
@@ -307,9 +311,50 @@ fn run_app(
                                 ));
                             }
                         }
+                    } else if app.search_mode {
+                        match key.code {
+                            KeyCode::Enter => {
+                                app.search_mode = false;
+                                app.status_message = Some((
+                                    format!("Filter applied: '{}'", app.search_query),
+                                    Instant::now(),
+                                ));
+                            }
+                            KeyCode::Esc => {
+                                app.search_mode = false;
+                                app.search_query.clear();
+                                app.status_message = Some((
+                                    "Search cancelled.".to_string(),
+                                    Instant::now(),
+                                ));
+                            }
+                            KeyCode::Backspace => {
+                                app.search_query.pop();
+                                app.table_state.select(Some(0));
+                            }
+                            KeyCode::Char(c) => {
+                                app.search_query.push(c);
+                                app.table_state.select(Some(0));
+                            }
+                            _ => {}
+                        }
                     } else {
                         match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                            KeyCode::Char('/') => {
+                                app.search_mode = true;
+                            }
+                            KeyCode::Esc => {
+                                if !app.search_query.is_empty() {
+                                    app.search_query.clear();
+                                    app.status_message = Some((
+                                        "Search filter cleared.".to_string(),
+                                        Instant::now(),
+                                    ));
+                                } else {
+                                    return Ok(());
+                                }
+                            }
+                            KeyCode::Char('q') => return Ok(()),
                             KeyCode::Char('x') | KeyCode::Char('X') => {
                                 if !app.wallets.is_empty() {
                                     app.confirm_clear = true;
@@ -431,19 +476,35 @@ fn run_app(
 
 fn get_filtered_indices(app: &App) -> Vec<usize> {
     let (_, current_theme_filter) = THEME_TABS[app.selected_theme_tab];
+    let query = app.search_query.trim().to_ascii_lowercase();
+
     app.wallets
         .iter()
         .enumerate()
         .filter_map(|(idx, w)| {
             if let Some(target_theme) = current_theme_filter {
-                if w.theme == target_theme {
-                    Some(idx)
-                } else {
-                    None
+                if w.theme != target_theme {
+                    return None;
                 }
-            } else {
-                Some(idx)
             }
+
+            if !query.is_empty() {
+                let addr_lower = w.address.to_ascii_lowercase();
+                let pat_lower = w.pattern.to_ascii_lowercase();
+                let title_lower = w.title.to_ascii_lowercase();
+                let pk_lower = w.private_key.to_ascii_lowercase();
+
+                let matches_query = addr_lower.contains(&query)
+                    || pat_lower.contains(&query)
+                    || title_lower.contains(&query)
+                    || pk_lower.contains(&query);
+
+                if !matches_query {
+                    return None;
+                }
+            }
+
+            Some(idx)
         })
         .collect()
 }
@@ -458,15 +519,31 @@ fn copy_to_clipboard(text: &str) {
 }
 
 fn ui(f: &mut ratatui::Frame, app: &mut App, filtered_indices: &[usize]) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(7),
-            Constraint::Length(2),
-        ])
-        .split(f.area());
+    let has_search = app.search_mode || !app.search_query.is_empty();
+    let (chunks, search_chunk) = if has_search {
+        let main_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Min(8),
+                Constraint::Length(7),
+                Constraint::Length(2),
+            ])
+            .split(f.area());
+        ([main_chunks[0], main_chunks[2], main_chunks[3], main_chunks[4]], Some(main_chunks[1]))
+    } else {
+        let main_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(8),
+                Constraint::Length(7),
+                Constraint::Length(2),
+            ])
+            .split(f.area());
+        ([main_chunks[0], main_chunks[1], main_chunks[2], main_chunks[3]], None)
+    };
 
     let tab_titles: Vec<Line> = THEME_TABS
         .iter()
@@ -496,6 +573,30 @@ fn ui(f: &mut ratatui::Frame, app: &mut App, filtered_indices: &[usize]) {
         )
         .select(app.selected_theme_tab);
     f.render_widget(tabs, chunks[0]);
+
+    if let Some(s_chunk) = search_chunk {
+        let (search_title, border_color) = if app.search_mode {
+            (" SEARCH VAULT [TYPE QUERY, PRESS ENTER TO CONFIRM, ESC TO CANCEL] ", Color::Yellow)
+        } else {
+            (" ACTIVE SEARCH FILTER [PRESS / TO EDIT, ESC TO CLEAR] ", Color::Cyan)
+        };
+        let query_display = if app.search_mode {
+            format!(" > {}█", app.search_query)
+        } else {
+            format!(" > {}", app.search_query)
+        };
+        let search_bar = Paragraph::new(query_display)
+            .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(border_color))
+                    .title(search_title)
+                    .title_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD)),
+            );
+        f.render_widget(search_bar, s_chunk);
+    }
 
     let header_cells = ["TIER", "NET", "ADDRESS", "TYPE", "PATTERN", "TIMESTAMP"]
         .iter()
@@ -550,9 +651,14 @@ fn ui(f: &mut ratatui::Frame, app: &mut App, filtered_indices: &[usize]) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .title(format!(
-                " RECORDS ({}/{}) ",
+                " RECORDS ({}/{}){} ",
                 filtered_indices.len(),
-                app.wallets.len()
+                app.wallets.len(),
+                if !app.search_query.is_empty() {
+                    format!(" [FILTER: '{}']", app.search_query)
+                } else {
+                    String::new()
+                }
             )),
     )
     .row_highlight_style(
@@ -627,18 +733,23 @@ fn ui(f: &mut ratatui::Frame, app: &mut App, filtered_indices: &[usize]) {
             "[CONFIRM WIPE] Delete ALL records from disk? Press [y] to CONFIRM, [n/Esc] to CANCEL",
             Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
         )
+    } else if app.search_mode {
+        Span::styled(
+            "[Type] Search Query  │  [Enter] Confirm & Navigate  │  [Esc] Cancel Search  │  [Backspace] Delete",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )
     } else if let Some((msg, time)) = &app.status_message {
         if time.elapsed() < Duration::from_secs(3) {
             Span::styled(msg, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
         } else {
             Span::styled(
-                "[↑/↓/j/k] Navigate  │  [Tab] Category  │  [c/Enter] Copy Addr  │  [p] Copy Key  │  [d] Delete Item  │  [x] Clear Vault  │  [q] Quit",
+                "[/] Search  │  [↑/↓/j/k] Navigate  │  [Tab] Category  │  [c/Enter] Copy Addr  │  [p] Copy Key  │  [d] Delete  │  [x] Clear  │  [q] Quit",
                 Style::default().fg(Color::DarkGray),
             )
         }
     } else {
         Span::styled(
-            "[↑/↓/j/k] Navigate  │  [Tab] Category  │  [c/Enter] Copy Addr  │  [p] Copy Key  │  [d] Delete Item  │  [x] Clear Vault  │  [q] Quit",
+            "[/] Search  │  [↑/↓/j/k] Navigate  │  [Tab] Category  │  [c/Enter] Copy Addr  │  [p] Copy Key  │  [d] Delete  │  [x] Clear  │  [q] Quit",
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -684,5 +795,51 @@ pattern:      00000
         assert_eq!(parsed[0].private_key, "0x8dbc9764b977dc7641205b5177f2d0e0774b8d63b55e3838943b1070f9711b2c");
         assert_eq!(parsed[0].rarity, Rarity::Legendary);
         assert_eq!(parsed[0].network, Network::Evm);
+    }
+
+    #[test]
+    fn test_search_filter() {
+        let mut app = App {
+            wallets: vec![
+                GeneratedWallet {
+                    network: Network::Evm,
+                    address: "0x1488133780D743d8726154A64398eA08F5D28C9B".to_string(),
+                    private_key: "0x150145a1".to_string(),
+                    rarity: Rarity::Godlike,
+                    theme: Theme::CustomTarget,
+                    score: 1000,
+                    title: "Match".to_string(),
+                    pattern: "14881337".to_string(),
+                    timestamp: "2026-09-08 00:00:00".to_string(),
+                },
+                GeneratedWallet {
+                    network: Network::Evm,
+                    address: "0x7777777777777777777777777777777777777777".to_string(),
+                    private_key: "0x2222".to_string(),
+                    rarity: Rarity::Godlike,
+                    theme: Theme::Repdigits,
+                    score: 1000,
+                    title: "Test".to_string(),
+                    pattern: "777".to_string(),
+                    timestamp: "2026-09-08 00:00:00".to_string(),
+                },
+            ],
+            table_state: TableState::default(),
+            selected_theme_tab: 0,
+            show_private_key: true,
+            status_message: None,
+            output_dir: "output".to_string(),
+            confirm_clear: false,
+            search_mode: false,
+            search_query: "14881337".to_string(),
+        };
+
+        let indices = get_filtered_indices(&app);
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0], 0);
+
+        app.search_query = "nonexistent".to_string();
+        let indices2 = get_filtered_indices(&app);
+        assert_eq!(indices2.len(), 0);
     }
 }
