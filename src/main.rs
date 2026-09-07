@@ -3,6 +3,8 @@ mod chains;
 mod analyzer;
 mod storage;
 mod tui;
+#[cfg(target_os = "macos")]
+mod metal;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -38,7 +40,7 @@ struct Args {
     #[arg(short, long, default_value_t = 0)]
     count: u32,
 
-    #[arg(short, long, default_value_t = 0)]
+    #[arg(short = 'T', long, default_value_t = 0)]
     threads: usize,
 
     #[arg(short, long)]
@@ -49,6 +51,18 @@ struct Args {
 
     #[arg(short, long, default_value = "output")]
     output_dir: String,
+
+    #[arg(long, default_value_t = false)]
+    gpu: bool,
+
+    #[arg(long, default_value_t = false)]
+    create2: bool,
+
+    #[arg(long)]
+    factory: Option<String>,
+
+    #[arg(long)]
+    init_code_hash: Option<String>,
 }
 
 fn parse_min_rarity(s: &str) -> Rarity {
@@ -86,6 +100,32 @@ fn is_bitcoin_compatible(target: &str) -> bool {
     !target.is_empty() && target.to_ascii_lowercase().chars().all(|c| BECH32_CHARS.contains(c))
 }
 
+fn parse_hex_20(s: &str) -> Result<[u8; 20], String> {
+    let clean = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if clean.len() != 40 {
+        return Err(format!("factory address must be 20 bytes (40 hex characters), got {}", clean.len()));
+    }
+    let mut out = [0u8; 20];
+    for i in 0..20 {
+        out[i] = u8::from_str_radix(&clean[i*2..i*2+2], 16)
+            .map_err(|e| format!("invalid hex at byte {}: {}", i, e))?;
+    }
+    Ok(out)
+}
+
+fn parse_hex_32(s: &str) -> Result<[u8; 32], String> {
+    let clean = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if clean.len() != 64 {
+        return Err(format!("init code hash must be 32 bytes (64 hex characters), got {}", clean.len()));
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&clean[i*2..i*2+2], 16)
+            .map_err(|e| format!("invalid hex at byte {}: {}", i, e))?;
+    }
+    Ok(out)
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -96,6 +136,386 @@ fn main() {
         return;
     }
 
+    let is_create2_mode = args.create2 || args.gpu || args.network.to_ascii_lowercase() == "create2";
+
+    if is_create2_mode {
+        run_create2_engine(&args);
+        return;
+    }
+
+    run_wallet_engine(&args);
+}
+
+fn run_create2_engine(args: &Args) {
+    let factory_bytes = match &args.factory {
+        Some(f) => match parse_hex_20(f) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                return;
+            }
+        },
+        None => {
+            let default_factory = "0000000000ffe8b47b3e21302130b649599b7940";
+            let mut out = [0u8; 20];
+            for i in 0..20 {
+                out[i] = u8::from_str_radix(&default_factory[i*2..i*2+2], 16).unwrap();
+            }
+            out
+        }
+    };
+
+    let init_hash_bytes = match &args.init_code_hash {
+        Some(h) => match parse_hex_32(h) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                return;
+            }
+        },
+        None => {
+            let default_hash = "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470";
+            let mut out = [0u8; 32];
+            for i in 0..32 {
+                out[i] = u8::from_str_radix(&default_hash[i*2..i*2+2], 16).unwrap();
+            }
+            out
+        }
+    };
+
+    let min_rarity = parse_min_rarity(&args.min_rarity);
+
+    let raw_target = if let Some(ref t) = args.target {
+        let t_trimmed = t.trim();
+        if t_trimmed.starts_with("0x") || t_trimmed.starts_with("0X") {
+            t_trimmed[2..].to_string()
+        } else {
+            t_trimmed.to_string()
+        }
+    } else {
+        String::new()
+    };
+
+    let mut clean_target = String::new();
+    let mut stripped_non_hex = false;
+    for c in raw_target.chars() {
+        if c.is_ascii_hexdigit() {
+            clean_target.push(c.to_ascii_lowercase());
+        } else {
+            stripped_non_hex = true;
+        }
+    }
+
+    if stripped_non_hex && !raw_target.is_empty() {
+        eprintln!("[NOTE] Stripped non-hex chars for EVM target: '{}' -> '0x{}'", raw_target, clean_target);
+    }
+
+    let mut target_nibbles = Vec::new();
+    if !clean_target.is_empty() {
+        for c in clean_target.chars() {
+            if let Some(d) = c.to_digit(16) {
+                target_nibbles.push(d as u8);
+            }
+        }
+    }
+
+    let min_zeros = if !clean_target.is_empty() {
+        3u32.min(target_nibbles.len() as u32)
+    } else {
+        match min_rarity {
+            Rarity::Godlike => 8u32,
+            Rarity::Mythic => 7u32,
+            Rarity::Legendary => 6u32,
+            Rarity::Epic => 6u32,
+            Rarity::Rare => 6u32,
+        }
+    };
+
+    #[cfg(target_os = "macos")]
+    let metal_engine = if metal::MetalEngine::is_supported() {
+        metal::MetalEngine::init()
+    } else {
+        None
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let metal_engine: Option<bool> = None;
+
+    let storage = Arc::new(Storage::new(&args.output_dir));
+    let running = Arc::new(AtomicBool::new(true));
+    let r_clone = running.clone();
+
+    let _ = ctrlc::set_handler(move || {
+        eprintln!("\ninterrupt signal received. finalizing writes...");
+        r_clone.store(false, Ordering::SeqCst);
+    });
+
+    let total_salts = Arc::new(AtomicU64::new(0));
+    let total_found = Arc::new(AtomicU32::new(0));
+    let count_godlike = Arc::new(AtomicU32::new(0));
+    let count_mythic = Arc::new(AtomicU32::new(0));
+    let count_legendary = Arc::new(AtomicU32::new(0));
+    let count_epic = Arc::new(AtomicU32::new(0));
+    let current_speed_khz = Arc::new(AtomicU64::new(0));
+
+    let factory_hex = format!("0x{}", chains::evm::hex::encode(&factory_bytes));
+    let init_hash_hex = format!("0x{}", chains::evm::hex::encode(&init_hash_bytes));
+
+    println!("\nvanity-gen v0.2.0 [darwin/aarch64]");
+    #[cfg(target_os = "macos")]
+    if let Some(ref engine) = metal_engine {
+        println!("engine:    Metal GPU Compute [{}]", engine.name());
+    } else {
+        println!("engine:    CPU Multi-Core");
+    }
+    #[cfg(not(target_os = "macos"))]
+    println!("engine:    CPU Multi-Core");
+
+    println!("mode:      CREATE2 Smart Contract Vanity Generator");
+    println!("factory:   {}", factory_hex);
+    println!("init_hash: {}", init_hash_hex);
+
+    if !clean_target.is_empty() {
+        println!("target:    0x{}", clean_target);
+        println!("milestone: progressive stages starting from 3 chars");
+    } else {
+        println!("filter:    >= {} leading zeros [{}]", min_zeros, min_rarity.badge());
+    }
+
+    if args.count > 0 {
+        println!("limit:     {} records", args.count);
+    } else {
+        println!("limit:     continuous (Ctrl+C to stop)");
+    }
+    println!("vault:     {}", args.output_dir);
+    println!("--------------------------------------------------------------------------------");
+
+    let running_stats = running.clone();
+    let total_s = total_salts.clone();
+    let cur_spd = current_speed_khz.clone();
+    let c_g = count_godlike.clone();
+    let c_m = count_mythic.clone();
+    let c_l = count_legendary.clone();
+    let c_e = count_epic.clone();
+    let has_target = !clean_target.is_empty();
+    let target_display = clean_target.clone();
+
+    let stats_thread = thread::spawn(move || {
+        let start_time = Instant::now();
+
+        while running_stats.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(250));
+            let current = total_s.load(Ordering::Relaxed);
+            let spd_khz = cur_spd.load(Ordering::Relaxed);
+            let speed_mhz = spd_khz as f64 / 1000.0;
+
+            let elapsed = start_time.elapsed().as_secs();
+            let elapsed_str = format!("{:02}:{:02}", elapsed / 60, elapsed % 60);
+
+            if has_target {
+                let stats_line = format!(
+                    "[{}] {:>6.2} MH/s | salts: {:>12} | target: 0x{} | found: {}",
+                    elapsed_str,
+                    speed_mhz,
+                    format_number(current),
+                    target_display,
+                    c_g.load(Ordering::Relaxed) + c_m.load(Ordering::Relaxed) + c_l.load(Ordering::Relaxed)
+                );
+                eprint!("\r{}", stats_line);
+            } else {
+                let stats_line = format!(
+                    "[{}] {:>6.2} MH/s | salts: {:>12} | t0: {} | t1: {} | t2: {} | t3: {}",
+                    elapsed_str,
+                    speed_mhz,
+                    format_number(current),
+                    c_g.load(Ordering::Relaxed),
+                    c_m.load(Ordering::Relaxed),
+                    c_l.load(Ordering::Relaxed),
+                    c_e.load(Ordering::Relaxed),
+                );
+                eprint!("\r{}", stats_line);
+            }
+        }
+        eprintln!();
+    });
+
+    #[cfg(target_os = "macos")]
+    if let Some(engine) = metal_engine {
+        let threads = 65536u32;
+        let iters = 40u32;
+        let batch_size = (threads as u64) * (iters as u64);
+        let mut base_salt = rand::random::<u64>();
+        let mut rolling_speed = 0.0f64;
+        let has_target = !clean_target.is_empty();
+        let target_len = clean_target.len();
+        let mut current_target_stage = if has_target {
+            3u32.min(target_len as u32)
+        } else {
+            min_zeros
+        };
+
+        while running.load(Ordering::Relaxed) {
+            if args.count > 0 && total_found.load(Ordering::Relaxed) >= args.count {
+                running.store(false, Ordering::Relaxed);
+                break;
+            }
+
+            let t0 = Instant::now();
+            let matches = engine.run_create2_batch(
+                &factory_bytes,
+                &init_hash_bytes,
+                base_salt,
+                threads,
+                iters,
+                current_target_stage,
+                &target_nibbles,
+            );
+            let dt = t0.elapsed().as_secs_f64();
+            if dt > 0.0001 {
+                let inst = (batch_size as f64 / dt) / 1000.0;
+                if rolling_speed == 0.0 {
+                    rolling_speed = inst;
+                } else {
+                    rolling_speed = rolling_speed * 0.75 + inst * 0.25;
+                }
+                current_speed_khz.store(rolling_speed as u64, Ordering::Relaxed);
+            }
+
+            total_salts.fetch_add(batch_size, Ordering::Relaxed);
+            base_salt = base_salt.wrapping_add(batch_size);
+
+            for m in matches {
+                let addr_str = EvmGenerator::format_address_checksum(&m.address);
+                let clean_addr = addr_str.trim_start_matches("0x");
+
+                let eval_match = if has_target {
+                    let match_len = calc_prefix_match(clean_addr, &clean_target, false);
+                    if match_len >= current_target_stage as usize {
+                        if match_len < target_len {
+                            current_target_stage = (match_len as u32 + 1).min(target_len as u32);
+                        }
+                        let rarity = if match_len >= target_len {
+                            Rarity::Godlike
+                        } else if match_len >= 6 {
+                            Rarity::Mythic
+                        } else {
+                            Rarity::Legendary
+                        };
+                        let matched_slice = &clean_addr[..match_len];
+                        Some(analyzer::BeautyMatch {
+                            rarity,
+                            theme: Theme::CustomTarget,
+                            score: (match_len as u32 * 110).min(1000),
+                            title: format!("CREATE2 Target milestone [{}/{}]: 0x{}", match_len, target_len, matched_slice),
+                            pattern: format!("Target: 0x{} (matched: 0x{})", clean_target, matched_slice),
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    Analyzer::evaluate(Network::Evm, &addr_str)
+                };
+
+                let beauty = match eval_match {
+                    Some(b) => b,
+                    None => continue,
+                };
+
+                if beauty.rarity < min_rarity || beauty.rarity < Rarity::Legendary {
+                    continue;
+                }
+
+                total_found.fetch_add(1, Ordering::Relaxed);
+                match beauty.rarity {
+                    Rarity::Godlike => { count_godlike.fetch_add(1, Ordering::Relaxed); }
+                    Rarity::Mythic => { count_mythic.fetch_add(1, Ordering::Relaxed); }
+                    Rarity::Legendary => { count_legendary.fetch_add(1, Ordering::Relaxed); }
+                    Rarity::Epic => { count_epic.fetch_add(1, Ordering::Relaxed); }
+                    Rarity::Rare => {}
+                }
+
+                let mut salt_bytes = [0u8; 32];
+                salt_bytes[0..8].copy_from_slice(&m.salt_low.to_le_bytes());
+                let salt_hex = format!("0x{}", chains::evm::hex::encode(&salt_bytes));
+                let short_salt = format!("0x{}...", chains::evm::hex::encode(&salt_bytes[0..4]));
+
+                let wallet = GeneratedWallet {
+                    network: Network::Evm,
+                    address: addr_str.clone(),
+                    private_key: salt_hex.clone(),
+                    rarity: beauty.rarity,
+                    theme: beauty.theme,
+                    score: beauty.score,
+                    title: beauty.title.clone(),
+                    pattern: format!("factory: {} | salt: {}", factory_hex, salt_hex),
+                    timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                };
+
+                storage.save(&wallet);
+
+                let time_str = Local::now().format("%H:%M:%S").to_string();
+
+                if has_target {
+                    let match_len = calc_prefix_match(clean_addr, &clean_target, false);
+                    let matched_slice = &clean_addr[..match_len];
+                    if match_len >= target_len {
+                        println!(
+                            "\r[{}] [{}] [CREATE2/GPU] {}  {} | matched: 0x{} --> COMPLETE",
+                            time_str.bright_black(),
+                            "TARGET: FULL".bright_green().bold(),
+                            addr_str.bright_green().bold(),
+                            format!("(salt: {})", short_salt).bright_black(),
+                            matched_slice.bright_yellow().bold()
+                        );
+                        if args.count > 0 && total_found.load(Ordering::Relaxed) >= args.count {
+                            running.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                    } else {
+                        println!(
+                            "\r[{}] [STAGE: {}/{}] [CREATE2/GPU] {}  {} | matched: 0x{}",
+                            time_str.bright_black(),
+                            match_len,
+                            target_len,
+                            addr_str.bright_white().bold(),
+                            format!("(salt: {})", short_salt).bright_black(),
+                            matched_slice.bright_yellow().bold()
+                        );
+                    }
+                } else {
+                    println!(
+                        "\r[{}] [{:<11}] [CREATE2/GPU] {}  {} | {}",
+                        time_str.bright_black(),
+                        beauty.rarity.badge().bold(),
+                        addr_str.bright_white().bold(),
+                        format!("(salt: {})", short_salt).bright_black(),
+                        beauty.title.bright_green()
+                    );
+                }
+
+                if args.count > 0 && total_found.load(Ordering::Relaxed) >= args.count {
+                    running.store(false, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = stats_thread.join();
+
+    println!("\n--------------------------------------------------------------------------------");
+    println!("session complete.");
+    println!("total salts evaluated: {}", format_number(total_salts.load(Ordering::Relaxed)));
+    println!("matches found:         {}", total_found.load(Ordering::Relaxed));
+    println!("tier-0 [ex]:           {}", count_godlike.load(Ordering::Relaxed));
+    println!("tier-1 [s]:            {}", count_mythic.load(Ordering::Relaxed));
+    println!("tier-2 [a]:            {}", count_legendary.load(Ordering::Relaxed));
+    println!("tier-3 [b]:            {}", count_epic.load(Ordering::Relaxed));
+    println!("vault directory:       {}", args.output_dir);
+    println!("--------------------------------------------------------------------------------");
+}
+
+fn run_wallet_engine(args: &Args) {
     let num_threads = if args.threads == 0 {
         num_cpus()
     } else {
@@ -215,8 +635,8 @@ fn main() {
 
     let storage = Arc::new(Storage::new(&args.output_dir));
 
-    let prefix_filter = args.prefix.map(|p| p.to_ascii_lowercase());
-    let suffix_filter = args.suffix.map(|s| s.to_ascii_lowercase());
+    let prefix_filter = args.prefix.as_ref().map(|p| p.to_ascii_lowercase());
+    let suffix_filter = args.suffix.as_ref().map(|s| s.to_ascii_lowercase());
     let target_query = if clean_target.is_empty() { None } else { Some(clean_target.clone()) };
     let case_sensitive = args.case_sensitive;
 

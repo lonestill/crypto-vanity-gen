@@ -20,6 +20,12 @@ use ratatui::{
 };
 
 use crate::types::{GeneratedWallet, Network, Rarity, Theme};
+use crate::storage::Storage;
+
+pub fn purge_vault(output_dir: &str) {
+    let _ = fs::remove_dir_all(output_dir);
+    let _ = Storage::new(output_dir);
+}
 
 pub fn run_tui(output_dir: &str) -> io::Result<()> {
     let wallets = load_all_wallets(output_dir);
@@ -30,7 +36,7 @@ pub fn run_tui(output_dir: &str) -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal, wallets);
+    let res = run_app(&mut terminal, wallets, output_dir);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -229,6 +235,8 @@ struct App {
     selected_theme_tab: usize,
     show_private_key: bool,
     status_message: Option<(String, Instant)>,
+    output_dir: String,
+    confirm_clear: bool,
 }
 
 const THEME_TABS: &[(&str, Option<Theme>)] = &[
@@ -247,6 +255,7 @@ const THEME_TABS: &[(&str, Option<Theme>)] = &[
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     wallets: Vec<GeneratedWallet>,
+    output_dir: &str,
 ) -> io::Result<()> {
     let mut app = App {
         wallets,
@@ -254,6 +263,8 @@ fn run_app(
         selected_theme_tab: 0,
         show_private_key: true,
         status_message: None,
+        output_dir: output_dir.to_string(),
+        confirm_clear: false,
     };
 
     if !app.wallets.is_empty() {
@@ -276,90 +287,141 @@ fn run_app(
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if !filtered_indices.is_empty() {
-                                let next = match app.table_state.selected() {
-                                    Some(i) => {
-                                        if i + 1 < filtered_indices.len() {
-                                            i + 1
-                                        } else {
-                                            0
-                                        }
-                                    }
-                                    None => 0,
-                                };
-                                app.table_state.select(Some(next));
+                    if app.confirm_clear {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                purge_vault(&app.output_dir);
+                                app.wallets.clear();
+                                app.table_state.select(None);
+                                app.confirm_clear = false;
+                                app.status_message = Some((
+                                    "Vault cleared! All stored keys purged.".to_string(),
+                                    Instant::now(),
+                                ));
+                            }
+                            _ => {
+                                app.confirm_clear = false;
+                                app.status_message = Some((
+                                    "Wipe cancelled.".to_string(),
+                                    Instant::now(),
+                                ));
                             }
                         }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            if !filtered_indices.is_empty() {
-                                let prev = match app.table_state.selected() {
-                                    Some(i) => {
-                                        if i > 0 {
-                                            i - 1
-                                        } else {
-                                            filtered_indices.len() - 1
-                                        }
-                                    }
-                                    None => 0,
-                                };
-                                app.table_state.select(Some(prev));
-                            }
-                        }
-                        KeyCode::Tab => {
-                            app.selected_theme_tab = (app.selected_theme_tab + 1) % THEME_TABS.len();
-                            app.table_state.select(Some(0));
-                        }
-                        KeyCode::BackTab => {
-                            if app.selected_theme_tab == 0 {
-                                app.selected_theme_tab = THEME_TABS.len() - 1;
-                            } else {
-                                app.selected_theme_tab -= 1;
-                            }
-                            app.table_state.select(Some(0));
-                        }
-                        KeyCode::Char(' ') => {
-                            app.show_private_key = !app.show_private_key;
-                            let state = if app.show_private_key { "VISIBLE" } else { "MASKED" };
-                            app.status_message = Some((
-                                format!("Private key view: {}", state),
-                                Instant::now(),
-                            ));
-                        }
-                        KeyCode::Char('c') | KeyCode::Enter => {
-                            if let Some(selected_idx) = app.table_state.selected() {
-                                if let Some(&actual_idx) = filtered_indices.get(selected_idx) {
-                                    let addr = &app.wallets[actual_idx].address;
-                                    copy_to_clipboard(addr);
+                    } else {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                            KeyCode::Char('x') | KeyCode::Char('X') => {
+                                if !app.wallets.is_empty() {
+                                    app.confirm_clear = true;
+                                } else {
                                     app.status_message = Some((
-                                        format!("Copied address: {}", addr),
+                                        "Vault is already empty.".to_string(),
                                         Instant::now(),
                                     ));
                                 }
                             }
-                        }
-                        KeyCode::Char('p') => {
-                            if let Some(selected_idx) = app.table_state.selected() {
-                                if let Some(&actual_idx) = filtered_indices.get(selected_idx) {
-                                    let priv_key = &app.wallets[actual_idx].private_key;
-                                    copy_to_clipboard(priv_key);
-                                    app.status_message = Some((
-                                        format!("Copied private key: {}", priv_key),
-                                        Instant::now(),
-                                    ));
+                            KeyCode::Char('d') | KeyCode::Delete => {
+                                if let Some(selected_idx) = app.table_state.selected() {
+                                    if let Some(&actual_idx) = filtered_indices.get(selected_idx) {
+                                        let addr = app.wallets[actual_idx].address.clone();
+                                        app.wallets.remove(actual_idx);
+                                        let all_json_path = format!("{}/wallets_all.json", app.output_dir);
+                                        if app.wallets.is_empty() {
+                                            purge_vault(&app.output_dir);
+                                            app.table_state.select(None);
+                                        } else if let Ok(serialized) = serde_json::to_string_pretty(&app.wallets) {
+                                            let _ = fs::write(&all_json_path, serialized);
+                                        }
+                                        app.status_message = Some((
+                                            format!("Deleted: {}", addr),
+                                            Instant::now(),
+                                        ));
+                                    }
                                 }
                             }
-                        }
-                        KeyCode::Char(digit) if digit.is_ascii_digit() => {
-                            let idx = digit.to_digit(10).unwrap() as usize;
-                            if idx < THEME_TABS.len() {
-                                app.selected_theme_tab = idx;
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if !filtered_indices.is_empty() {
+                                    let next = match app.table_state.selected() {
+                                        Some(i) => {
+                                            if i + 1 < filtered_indices.len() {
+                                                i + 1
+                                            } else {
+                                                0
+                                            }
+                                        }
+                                        None => 0,
+                                    };
+                                    app.table_state.select(Some(next));
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if !filtered_indices.is_empty() {
+                                    let prev = match app.table_state.selected() {
+                                        Some(i) => {
+                                            if i > 0 {
+                                                i - 1
+                                            } else {
+                                                filtered_indices.len() - 1
+                                            }
+                                        }
+                                        None => 0,
+                                    };
+                                    app.table_state.select(Some(prev));
+                                }
+                            }
+                            KeyCode::Tab => {
+                                app.selected_theme_tab = (app.selected_theme_tab + 1) % THEME_TABS.len();
                                 app.table_state.select(Some(0));
                             }
+                            KeyCode::BackTab => {
+                                if app.selected_theme_tab == 0 {
+                                    app.selected_theme_tab = THEME_TABS.len() - 1;
+                                } else {
+                                    app.selected_theme_tab -= 1;
+                                }
+                                app.table_state.select(Some(0));
+                            }
+                            KeyCode::Char(' ') => {
+                                app.show_private_key = !app.show_private_key;
+                                let state = if app.show_private_key { "VISIBLE" } else { "MASKED" };
+                                app.status_message = Some((
+                                    format!("Private key view: {}", state),
+                                    Instant::now(),
+                                ));
+                            }
+                            KeyCode::Char('c') | KeyCode::Enter => {
+                                if let Some(selected_idx) = app.table_state.selected() {
+                                    if let Some(&actual_idx) = filtered_indices.get(selected_idx) {
+                                        let addr = &app.wallets[actual_idx].address;
+                                        copy_to_clipboard(addr);
+                                        app.status_message = Some((
+                                            format!("Copied address: {}", addr),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                }
+                            }
+                            KeyCode::Char('p') => {
+                                if let Some(selected_idx) = app.table_state.selected() {
+                                    if let Some(&actual_idx) = filtered_indices.get(selected_idx) {
+                                        let priv_key = &app.wallets[actual_idx].private_key;
+                                        copy_to_clipboard(priv_key);
+                                        app.status_message = Some((
+                                            format!("Copied private key: {}", priv_key),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                }
+                            }
+                            KeyCode::Char(digit) if digit.is_ascii_digit() => {
+                                let idx = digit.to_digit(10).unwrap() as usize;
+                                if idx < THEME_TABS.len() {
+                                    app.selected_theme_tab = idx;
+                                    app.table_state.select(Some(0));
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -555,18 +617,23 @@ fn ui(f: &mut ratatui::Frame, app: &mut App, filtered_indices: &[usize]) {
         f.render_widget(empty, chunks[2]);
     }
 
-    let status_text = if let Some((msg, time)) = &app.status_message {
+    let status_text = if app.confirm_clear {
+        Span::styled(
+            "[CONFIRM WIPE] Delete ALL records from disk? Press [y] to CONFIRM, [n/Esc] to CANCEL",
+            Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+        )
+    } else if let Some((msg, time)) = &app.status_message {
         if time.elapsed() < Duration::from_secs(3) {
             Span::styled(msg, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
         } else {
             Span::styled(
-                "[↑/↓/j/k] Navigate  │  [Tab] Category  │  [c/Enter] Copy Address  │  [p] Copy Private Key  │  [Space] Toggle Key  │  [q] Quit",
+                "[↑/↓/j/k] Navigate  │  [Tab] Category  │  [c/Enter] Copy Addr  │  [p] Copy Key  │  [d] Delete Item  │  [x] Clear Vault  │  [q] Quit",
                 Style::default().fg(Color::DarkGray),
             )
         }
     } else {
         Span::styled(
-            "[↑/↓/j/k] Navigate  │  [Tab] Category  │  [c/Enter] Copy Address  │  [p] Copy Private Key  │  [Space] Toggle Key  │  [q] Quit",
+            "[↑/↓/j/k] Navigate  │  [Tab] Category  │  [c/Enter] Copy Addr  │  [p] Copy Key  │  [d] Delete Item  │  [x] Clear Vault  │  [q] Quit",
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -581,12 +648,15 @@ mod tests {
 
     #[test]
     fn test_load_all_wallets() {
-        let wallets = load_all_wallets("output");
+        let tmp_dir = std::env::temp_dir().join("vanity_test_vault");
+        let _ = fs::create_dir_all(&tmp_dir);
+        let sample_json = tmp_dir.join("wallets_all.json");
+        let sample = r#"[{"network":"Evm","address":"0x7777777777777777777777777777777777777777","private_key":"0x1111","rarity":"Godlike","theme":"Repdigits","score":1000,"title":"Test","pattern":"777","timestamp":"2026-09-08 00:00:00"}]"#;
+        let _ = fs::write(&sample_json, sample);
+        let wallets = load_all_wallets(tmp_dir.to_str().unwrap());
         assert!(!wallets.is_empty());
-        for w in &wallets {
-            assert!(!w.address.is_empty());
-            assert!(!w.private_key.is_empty());
-        }
+        assert_eq!(wallets[0].address, "0x7777777777777777777777777777777777777777");
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]

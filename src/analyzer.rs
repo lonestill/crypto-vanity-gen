@@ -236,9 +236,9 @@ impl Analyzer {
         if zero_count == 5 {
             let pat: String = clean.chars().take(5).collect();
             return Some(BeautyMatch {
-                rarity: Rarity::Legendary,
+                rarity: Rarity::Epic,
                 theme: Theme::HackerHex,
-                score: 850,
+                score: 800,
                 title: "Zero prefix: 5 consecutive zeros".to_string(),
                 pattern: pat,
             });
