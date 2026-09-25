@@ -16,6 +16,7 @@ impl Analyzer {
             Network::Evm => address.trim_start_matches("0x"),
             Network::Bitcoin => address.trim_start_matches("bc1q"),
             Network::Solana => address,
+            Network::Ton => address.strip_prefix("EQ").or_else(|| address.strip_prefix("UQ")).unwrap_or(address),
         };
 
         if clean.len() < 8 {
@@ -419,14 +420,21 @@ impl Analyzer {
 
     fn check_crypto_elite(clean: &str, lower: &str) -> Option<BeautyMatch> {
         const ELITE_CRYPTO: &[(&str, Rarity, u32)] = &[
+            ("lonestill", Rarity::Godlike, 1000),
             ("nakamoto", Rarity::Godlike, 990),
             ("ethereum", Rarity::Godlike, 990),
             ("satoshi",  Rarity::Godlike, 980),
             ("bitcoin",  Rarity::Godlike, 980),
+            ("toncoin",  Rarity::Godlike, 980),
+            ("telegram", Rarity::Godlike, 980),
+            ("durov777", Rarity::Godlike, 970),
             ("moon777",  Rarity::Mythic,  940),
             ("pump777",  Rarity::Mythic,  940),
             ("hodl777",  Rarity::Mythic,  940),
             ("solana",   Rarity::Mythic,  930),
+            ("notcoin",  Rarity::Mythic,  930),
+            ("durov",    Rarity::Mythic,  920),
+            ("ton777",   Rarity::Mythic,  920),
         ];
 
         for &(w, rarity, score) in ELITE_CRYPTO {

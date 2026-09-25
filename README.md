@@ -1,13 +1,13 @@
 # crypto-vanity-gen
 
 High-performance cryptographic vanity address generator written in Rust with native Apple Silicon Metal GPU compute acceleration.
-Supports EVM (Ethereum / Base / BSC / Polygon / Arbitrum), Solana (Ed25519), Bitcoin (Native SegWit bech32), and CREATE2 contract vanity deployment.
+Supports EVM (Ethereum / Base / BSC / Polygon / Arbitrum), Solana (Ed25519), Bitcoin (Native SegWit bech32), TON (The Open Network Wallet v4R2), and CREATE2 contract vanity deployment.
 
 ## Features
 
 - Native Apple Silicon Metal GPU compute shaders (13+ MH/s on M1)
 - Multi-core multithreaded architecture (Rayon + native thread workers)
-- Cryptographic engines: secp256k1 (EVM), Ed25519 (Solana), Bech32 v0 P2WPKH (Bitcoin), Keccak-256 (CREATE2)
+- Cryptographic engines: secp256k1 (EVM), Ed25519 (Solana, TON v4R2), Bech32 v0 P2WPKH (Bitcoin), Keccak-256 (CREATE2)
 - Pattern matching: leading zeros, sequential ladders, monolith repdigits, symmetric bookends, binary matrix, dictionary tokens
 - Built-in terminal explorer (Ratatui TUI) with clipboard integration (`pbcopy`)
 - Fully local and offline execution
@@ -47,10 +47,11 @@ Search for a specific prefix or exact sequence across compatible chains:
 ```bash
 ./target/release/crypto-vanity-gen --target 0x7777777
 ./target/release/crypto-vanity-gen --target Aye777
+./target/release/crypto-vanity-gen --network ton --target 777
 ```
 
 ### 4. Omni Search (All Networks)
-Continuously scan for mathematically and structurally rare addresses:
+Continuously scan for mathematically and structurally rare addresses across all chains (EVM, SOL, BTC, TON):
 ```bash
 ./target/release/crypto-vanity-gen --network all
 ```
@@ -65,6 +66,9 @@ Continuously scan for mathematically and structurally rare addresses:
 
 # Bitcoin only
 ./target/release/crypto-vanity-gen --network btc
+
+# TON only (Wallet v4R2, bounceable EQ... / non-bounceable UQ...)
+./target/release/crypto-vanity-gen --network ton
 ```
 
 ### 6. Terminal Explorer (TUI)

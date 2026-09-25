@@ -199,6 +199,8 @@ fn parse_txt_cards(content: &str) -> Vec<GeneratedWallet> {
                     network = Some(Network::Solana);
                 } else if n_str.contains("BTC") || n_str.contains("Bitcoin") {
                     network = Some(Network::Bitcoin);
+                } else if n_str.contains("TON") {
+                    network = Some(Network::Ton);
                 }
             } else if let Some(rest) = line.strip_prefix("address:").or_else(|| line.strip_prefix("Адрес:")) {
                 address = Some(rest.trim().to_string());
@@ -619,6 +621,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App, filtered_indices: &[usize]) {
                 Network::Evm => "EVM",
                 Network::Solana => "SOL",
                 Network::Bitcoin => "BTC",
+                Network::Ton => "TON",
             };
 
             let theme_str = w.theme.badge();

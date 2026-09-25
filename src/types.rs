@@ -5,6 +5,7 @@ pub enum Network {
     Evm,
     Solana,
     Bitcoin,
+    Ton,
 }
 
 impl std::fmt::Display for Network {
@@ -13,6 +14,7 @@ impl std::fmt::Display for Network {
             Network::Evm => write!(f, "EVM"),
             Network::Solana => write!(f, "SOL"),
             Network::Bitcoin => write!(f, "BTC"),
+            Network::Ton => write!(f, "TON"),
         }
     }
 }

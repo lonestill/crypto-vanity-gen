@@ -18,7 +18,7 @@ use clap::Parser;
 use chrono::Local;
 
 use types::{Network, Rarity, Theme, GeneratedWallet};
-use chains::{EvmGenerator, SolanaGenerator, BitcoinGenerator};
+use chains::{EvmGenerator, SolanaGenerator, BitcoinGenerator, TonGenerator};
 use analyzer::Analyzer;
 use storage::Storage;
 
@@ -103,6 +103,22 @@ fn is_bitcoin_compatible(target: &str) -> bool {
     !target.is_empty() && target.to_ascii_lowercase().chars().all(|c| BECH32_CHARS.contains(c))
 }
 
+fn is_ton_compatible(target: &str, case_sensitive: bool) -> bool {
+    const B64_CHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    if target.is_empty() {
+        return false;
+    }
+    if case_sensitive {
+        target.chars().all(|c| B64_CHARS.contains(c))
+    } else {
+        target.chars().all(|c| {
+            let lower = c.to_ascii_lowercase();
+            let upper = c.to_ascii_uppercase();
+            B64_CHARS.contains(lower) || B64_CHARS.contains(upper) || c == '-' || c == '_'
+        })
+    }
+}
+
 fn parse_hex_20(s: &str) -> Result<[u8; 20], String> {
     let clean = s.trim().trim_start_matches("0x").trim_start_matches("0X");
     if clean.len() != 40 {
@@ -132,7 +148,7 @@ fn parse_hex_32(s: &str) -> Result<[u8; 32], String> {
 fn main() {
     let args = Args::parse();
 
-    if args.view {
+    if args.view || std::env::args().len() == 1 {
         if let Err(e) = tui::run_tui(&args.output_dir) {
             eprintln!("TUI error: {}", e);
         }
@@ -880,17 +896,19 @@ fn run_wallet_engine(args: &Args) {
 
     let min_rarity = parse_min_rarity(&args.min_rarity);
 
-    let (clean_target, user_typed_0x, user_typed_bc1q) = if let Some(ref t) = args.target {
+    let (clean_target, user_typed_0x, user_typed_bc1q, user_typed_ton) = if let Some(ref t) = args.target {
         let t_trimmed = t.trim();
         if t_trimmed.starts_with("0x") || t_trimmed.starts_with("0X") {
-            (t_trimmed[2..].to_string(), true, false)
+            (t_trimmed[2..].to_string(), true, false, false)
         } else if t_trimmed.to_ascii_lowercase().starts_with("bc1q") {
-            (t_trimmed[4..].to_string(), false, true)
+            (t_trimmed[4..].to_string(), false, true, false)
+        } else if (t_trimmed.starts_with("EQ") || t_trimmed.starts_with("UQ") || t_trimmed.starts_with("eq") || t_trimmed.starts_with("uq")) && t_trimmed.len() > 2 {
+            (t_trimmed[2..].to_string(), false, false, true)
         } else {
-            (t_trimmed.to_string(), false, false)
+            (t_trimmed.to_string(), false, false, false)
         }
     } else {
-        (String::new(), false, false)
+        (String::new(), false, false, false)
     };
 
     let active_networks: Vec<Network> = if args.target.is_some() {
@@ -898,6 +916,7 @@ fn run_wallet_engine(args: &Args) {
             "evm" | "eth" => Some(vec![Network::Evm]),
             "sol" | "solana" => Some(vec![Network::Solana]),
             "btc" | "bitcoin" => Some(vec![Network::Bitcoin]),
+            "ton" => Some(vec![Network::Ton]),
             _ => {
                 if user_typed_0x {
                     if is_evm_compatible(&clean_target) {
@@ -908,6 +927,12 @@ fn run_wallet_engine(args: &Args) {
                 } else if user_typed_bc1q {
                     if is_bitcoin_compatible(&clean_target) {
                         Some(vec![Network::Bitcoin])
+                    } else {
+                        None
+                    }
+                } else if user_typed_ton {
+                    if is_ton_compatible(&clean_target, args.case_sensitive) {
+                        Some(vec![Network::Ton])
                     } else {
                         None
                     }
@@ -930,6 +955,9 @@ fn run_wallet_engine(args: &Args) {
             if is_bitcoin_compatible(&clean_target) {
                 compatible.push(Network::Bitcoin);
             }
+            if is_ton_compatible(&clean_target, args.case_sensitive) {
+                compatible.push(Network::Ton);
+            }
 
             if compatible.is_empty() {
                 vec![Network::Solana]
@@ -942,12 +970,13 @@ fn run_wallet_engine(args: &Args) {
             "evm" | "eth" => vec![Network::Evm],
             "sol" | "solana" => vec![Network::Solana],
             "btc" | "bitcoin" => vec![Network::Bitcoin],
-            _ => vec![Network::Evm, Network::Solana, Network::Bitcoin],
+            "ton" => vec![Network::Ton],
+            _ => vec![Network::Evm, Network::Solana, Network::Bitcoin, Network::Ton],
         }
     };
 
     println!("\nvanity-gen v0.2.0 [darwin/aarch64]");
-    println!("workers:   {} [secp256k1, ed25519, bech32]", num_threads);
+    println!("workers:   {} [secp256k1, ed25519, bech32, ton-v4r2]", num_threads);
     if let Some(ref t) = args.target {
         println!("target:    {}", t);
         let net_names: Vec<String> = active_networks.iter().map(|n| n.to_string()).collect();
@@ -1020,6 +1049,7 @@ fn run_wallet_engine(args: &Args) {
             let evm_gen = EvmGenerator::new();
             let sol_gen = SolanaGenerator::new();
             let btc_gen = BitcoinGenerator::new();
+            let ton_gen = TonGenerator::new();
 
             let mut local_counter: u64 = 0;
             let num_nets = thread_networks.len();
@@ -1041,6 +1071,7 @@ fn run_wallet_engine(args: &Args) {
                     }
                     Network::Solana => sol_gen.generate(&mut rng),
                     Network::Bitcoin => btc_gen.generate(&mut rng),
+                    Network::Ton => ton_gen.generate(&mut rng),
                 };
 
                 local_counter += 1;
@@ -1053,6 +1084,21 @@ fn run_wallet_engine(args: &Args) {
                         Network::Evm => address.trim_start_matches("0x"),
                         Network::Bitcoin => address.trim_start_matches("bc1q"),
                         Network::Solana => &address,
+                        Network::Ton => {
+                            let rest = if address.starts_with("EQ") || address.starts_with("UQ") {
+                                &address[2..]
+                            } else {
+                                &address
+                            };
+                            let first_tgt = target.chars().next().unwrap_or(' ');
+                            if ['A', 'B', 'C', 'D', 'a', 'b', 'c', 'd'].contains(&first_tgt) {
+                                rest
+                            } else if rest.len() > 1 {
+                                &rest[1..]
+                            } else {
+                                rest
+                            }
+                        }
                     };
 
                     let match_len = calc_prefix_match(clean_addr, target, case_sensitive);
@@ -1109,6 +1155,7 @@ fn run_wallet_engine(args: &Args) {
                             Network::Evm => "EVM",
                             Network::Solana => "SOL",
                             Network::Bitcoin => "BTC",
+                            Network::Ton => "TON",
                         };
 
                         println!(
@@ -1172,6 +1219,7 @@ fn run_wallet_engine(args: &Args) {
                                 Network::Evm => "EVM",
                                 Network::Solana => "SOL",
                                 Network::Bitcoin => "BTC",
+                                Network::Ton => "TON",
                             };
 
                             println!(
@@ -1190,9 +1238,30 @@ fn run_wallet_engine(args: &Args) {
 
                 let custom_matched = if prefix_f.is_some() || suffix_f.is_some() {
                     let addr_lower = address.to_ascii_lowercase();
-                    let clean_addr = addr_lower
-                        .trim_start_matches("0x")
-                        .trim_start_matches("bc1q");
+                    let clean_addr = match net {
+                        Network::Ton => {
+                            let raw_ton = if addr_lower.starts_with("eq") || addr_lower.starts_with("uq") {
+                                &addr_lower[2..]
+                            } else {
+                                &addr_lower
+                            };
+                            if let Some(ref p) = prefix_f {
+                                let first_p = p.chars().next().unwrap_or(' ');
+                                if ['a', 'b', 'c', 'd'].contains(&first_p) {
+                                    raw_ton
+                                } else if raw_ton.len() > 1 {
+                                    &raw_ton[1..]
+                                } else {
+                                    raw_ton
+                                }
+                            } else {
+                                raw_ton
+                            }
+                        }
+                        _ => addr_lower
+                            .trim_start_matches("0x")
+                            .trim_start_matches("bc1q"),
+                    };
                     
                     let p_ok = match &prefix_f {
                         Some(p) => clean_addr.starts_with(p),
@@ -1253,6 +1322,7 @@ fn run_wallet_engine(args: &Args) {
                             Network::Evm => "EVM",
                             Network::Solana => "SOL",
                             Network::Bitcoin => "BTC",
+                            Network::Ton => "TON",
                         };
 
                         println!(
